@@ -13,6 +13,22 @@
 
 (defparameter *test-lib* (load-foreign-library #P"/Users/jeremyphelps/Library/Developer/Xcode/DerivedData/Testing-gteieshxlukrkbdowshxnxgffxkl/Build/Products/Debug/libTesting.dylib"))
 
+;; You may find that libExceptionWrapper.dylib must be installed in /usr/local/lib for this
+;; to work. When I load this project on macOS with ASDF, I find that the FASL gets compiled
+;; to ~/.cache/common-lisp/sbcl-1.5.1-macosx-x84/..../obj-cffi.fasl, which makes it impossible
+;; to load another file from the same directory as the Lisp source file.
+
+(defvar *exception-wrapper* (restart-case
+				(handler-bind ((load-foreign-library-error
+						(lambda (exn)
+						  (declare (ignore exn))
+						  (ignore-errors
+						    (progn
+						      (format t "~%libExceptionWrapper.dylib not found in standard directories; trying to load from ~s~%" (merge-pathnames #P"libExceptionWrapper.dylib" *load-truename*))
+						      (invoke-restart 'continue (load-foreign-library (merge-pathnames #P"libExceptionWrapper.dylib" *load-truename*))))))))
+				  (load-foreign-library "libExceptionWrapper.dylib"))
+			      (continue (library) library)))
+
 ;; In Objective-C, exception handling is implemented with the C functions
 ;; obj_exception_throw, obj_exception_try_enter, obj_exception_try_exit, and
 ;; others. The full list of functions can be found by searching for the text
@@ -190,6 +206,9 @@
   (extra-byte #+64-bit :uint64
 	      #-64-bit :uint3))
 
+(defcfun ("objc_disposeClassPair" objc-dispose-class-pair) :void
+  (class :pointer))
+
 (defcfun ("class_addIvar" class-add-ivar) :int
   (cls :pointer)
   (name :string)
@@ -209,10 +228,17 @@
   (ivar :pointer)
   (value :pointer))
 
+(defcfun ("object_getIvar" object-get-instance-variable-value) :pointer
+  (obj :pointer)
+  (ivar :pointer))
+
 (defcfun ("object_setInstanceVariable" object-set-instance-variable) :pointer
   (obj :pointer)
   (name :string)
   (value :pointer))
+
+(defcfun ("object_getClass" object-get-class) :pointer
+  (object :pointer))
 
 ;; FIXME: I'm trying to implement a class using this working example:
 ;;
@@ -243,11 +269,17 @@ will be declared to return the type :POINTER.
 
 The function will have an implicit first argument declared as (SELF :POINTER)."
   `(defcallback ,name :pointer ((self :pointer) ,@(loop for arg in arguments
-						     collect `(,arg :pointer))
-				,@body)))
+						     collect `(,arg :pointer)))
+				,@body))
 
 (defcfun "objc_lookUpClass" (:pointer)
   (name :string))
+
+(defcfun ("objc_registerClassPair" objc-register-class-pair) :void
+  (class :pointer))
+
+(defcfun ("class_getSuperclass" class-get-superclass) :pointer
+  (class :pointer))
 
 (defcfun "class_isMetaClass" :int
   (class :pointer))
@@ -267,13 +299,14 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
   (class :pointer)
   (name :string))
 
+
 (defcfun ("ivar_getOffset" ivar-get-offset) #+x86-64 :long-long #-x86-64 :long
   (ivar :pointer))
 
 (defcfun "method_getName" :pointer
   (method :pointer))
 
-(defcfun "sel_getName" :string
+(defcfun "sel_getName" :pointer
   (selector :pointer))
 
 (defcfun ("sel_registerName" sel-register-name) :pointer
@@ -369,8 +402,11 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
   (ptr :pointer))
 
 (defun method-name (method)
- ;; FIXME: The string we get from this may need to be freed.
-  (sel-getname (method-getname method)))
+  ;; FIXME: The string we get from this may need to be freed.
+  (let ((name-pointer (sel-getname (method-getname method))))
+    (if (null-pointer-p method)
+	nil
+	(c-string->lisp-string name-pointer))))
 
 (defun c-string->lisp-string (ptr &key free)
   "Given a CFFI pointer, extract a string from it."
@@ -411,23 +447,50 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	 until (null-pointer-p value)
 	 collect value))))
   
-(defun get-methods (class)
+(defun get-direct-methods (class)
   "Given a an Objective-C CLASS, returns a list of pointers to Objective-C Method objects."
   (get-meta-list class #'class-copymethodlist))
+
+(defun has-superclass-p (class)
+  (not
+   (or (eq class *ns-object*)
+       (eq (class-get-superclass class) class)
+       (null-pointer-p (class-get-superclass class)))))
+
+(defun get-all-methods (class)
+  (append (get-direct-methods class)
+	  (if (not (has-superclass-p class))
+	      nil
+	      (get-all-methods (class-get-superclass class)))))
 
 (defun get-ivars (class)
   "Given an Objective-C CLASS, returns a list of pointers to Objective-C Ivar objects."
   (get-meta-list class #'class-copyivarlist))
 
 (defun get-method-by-name (class name)
-  (loop for method in (get-methods class)
-     when (string= name (method-name method))
-       return method))
+  (or 
+   (loop for method in (get-direct-methods class)
+      when (string= name (method-name method))
+      return method)
+   (and (has-superclass-p class)
+	(get-method-by-name (class-get-superclass class) name))))
 
 (defun methods-matching-regex (class regex)
-  (loop for method in (get-methods class)
-     when (cl-ppcre:all-matches regex (method-name method))
-       collect method))
+  (append
+   (loop for method in (get-direct-methods class)
+      when (cl-ppcre:all-matches regex (method-name method))
+      collect method)
+   (and (has-superclass-p class)
+	(methods-matching-regex (class-get-superclass class) regex))))
+
+(defun add-ivar (class name cffi-type objc-type)
+  (unless (= (class-add-ivar class name (foreign-type-size cffi-type)
+			     (coerce (floor (log (foreign-type-size cffi-type) 2))
+				     'integer)
+			     (encode-type objc-type))
+	     1)
+    (error "Unable to add instance variable ~s to class ~s" name class)))
+  
 
 ;; I'm telling CFFI that these are pointers, but they are
 ;; not.
@@ -505,4 +568,36 @@ be able to call it from Objective-C. And, it's totally undocumented."
 			(callback test-class-init)
 			type-string))
     
+|#
+
+(defclass objective-c-class ()
+  ((class-pointer :initarg :class-pointer)
+   (c-name :type string :initarg :c-name)
+   (ivar-offsets :type list :initform nil :initarg :ivar-offsets)))
+
+(defun make-accessor-name (class-name slot-name)
+  (intern (format nil "~a-~a" class-name slot-name)
+	  (symbol-package slot-name)))
+
+(defun add-objective-c-accessor (class-name slot-def)
+  (if (getf (cdr slot-def) :accessor)
+      slot-def
+      (destructuring-bind (name &rest options)
+	  slot-def
+	`(,name :accessor ,(make-accessor-name class-name name)
+		,@options))))
+	  
+
+#| (defmacro define-objective-c-class (class-name superclass direct-slots
+				    &rest defclass-options)
+  (let ((modified-slots (mapcar (lambda (slot)
+				  (add-objective-c-accessor class-name slot))
+				direct-slots)))
+    `(progn
+       (defclass ,class-name (,superclass)
+	 ,modified-slots
+	 ,@defclass-options)
+       ,@(loop for (slot-name . options) in modified-slots
+	    collect `(defmethod ,(getf :accessor options) :before ((object ,class-name))
+				
 |#
