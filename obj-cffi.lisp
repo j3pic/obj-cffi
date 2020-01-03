@@ -223,14 +223,14 @@
   (imp :pointer)
   (type-string :string))
 
-(defcfun ("object_setIvar" object-set-ivar) :void
-  (obj :pointer)
-  (ivar :pointer)
-  (value :pointer))
-
 (defcfun ("object_getIvar" object-get-instance-variable-value) :pointer
   (obj :pointer)
   (ivar :pointer))
+
+(defcfun ("object_setIvar" object-set-instance-variable-value) :void
+  (obj :pointer)
+  (ivar :pointer)
+  (value :pointer))
 
 (defcfun ("object_setInstanceVariable" object-set-instance-variable) :pointer
   (obj :pointer)
@@ -268,9 +268,10 @@ The function is expected to return an Objective-C 'id' object. The generated CFF
 will be declared to return the type :POINTER.
 
 The function will have an implicit first argument declared as (SELF :POINTER)."
-  `(defcallback ,name :pointer ((self :pointer) ,@(loop for arg in arguments
-						     collect `(,arg :pointer)))
-				,@body))
+  `(defcallback ,name :pointer ((self :pointer) (selector-name :string)
+				,@arguments)
+     (declare (ignorable self selector-name))
+     ,@body))
 
 (defcfun "objc_lookUpClass" (:pointer)
   (name :string))
@@ -301,6 +302,9 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
 
 
 (defcfun ("ivar_getOffset" ivar-get-offset) #+x86-64 :long-long #-x86-64 :long
+  (ivar :pointer))
+
+(defcfun ("ivar_getName" ivar-get-name) :string
   (ivar :pointer))
 
 (defcfun "method_getName" :pointer
@@ -340,7 +344,7 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
   `(progn
      ,@(loop for return-type in '(:int :uint :long :ulong #-(or x86-64 x86) :float #-(or x86-64 x86) :double
 				  :long-long :unsigned-long-long :string
-				  :pointer)
+				  :pointer :void)
 	  collect
 	    `(defcfun ("objc_msgSend" ,(intern (format nil "OBJC-MSG-SEND-~A" return-type))) ,return-type
 	       (self :pointer)
@@ -467,6 +471,29 @@ be able to call it from Objective-C. And, it's totally undocumented."
   "Given an Objective-C CLASS, returns a list of pointers to Objective-C Ivar objects."
   (get-meta-list class #'class-copyivarlist))
 
+
+(defcfun ("class_getInstanceVariable" get-ivar-by-name) :pointer
+  (class :pointer)
+  (name :string))
+
+
+(defun objc-slot-value (object ivar-name &key by-offset (offset-type :int))
+  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
+    (if by-offset
+	(let ((offset (ivar-get-offset ivar)))
+	  (mem-ref object offset-type offset))
+	(object-get-instance-variable-value object
+					    ivar))))
+
+(defun (setf objc-slot-value) (new-value object ivar-name &key by-offset (offset-type :int))
+  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
+    (if by-offset
+	(setf (mem-ref object offset-type (ivar-get-offset ivar))
+	      new-value)
+	(object-set-instance-variable-value object ivar
+					    new-value))))
+  
+
 (defun get-method-by-name (class name)
   (or 
    (loop for method in (get-direct-methods class)
@@ -555,7 +582,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	 (age-ivar (class-get-instance-variable c "age"))
 	 (age-offset (ivar-get-offset age-ivar)))
     
-    (defimp test-class-init (first-name last-name age)
+    (defimp test-class-init ((first-name :string) (last-name :string) (age :int))
       (object-set-ivar self first-name-ivar first-name)
       (object-set-ivar self last-name-ivar last-name)
       (setf (mem-ref age-offset :unsigned-int) age)
