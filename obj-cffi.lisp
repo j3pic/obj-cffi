@@ -1,5 +1,5 @@
-(defpackage #:obj-cffi
-  (:use #:common-lisp #:cffi))
+defpackage #:obj-cffi
+  (:use #:closer-common-lisp #:cffi #:uiop/utility))
 
 (in-package #:obj-cffi)
 
@@ -405,7 +405,7 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
 (defcfun "free" :void
   (ptr :pointer))
 
-(defun method-name (method)
+(defun objc-method-name (method)
   ;; FIXME: The string we get from this may need to be freed.
   (let ((name-pointer (sel-getname (method-getname method))))
     (if (null-pointer-p method)
@@ -477,7 +477,10 @@ be able to call it from Objective-C. And, it's totally undocumented."
   (name :string))
 
 
-(defun objc-slot-value (object ivar-name &key by-offset (offset-type :int))
+(defgeneric objc-slot-value (object ivar-name &key by-offset offset-type))
+(defgeneric (setf objc-slot-value) (new-value object ivar-name &key by-offset offset-type))
+
+(defmethod objc-slot-value (object ivar-name &key by-offset (offset-type :int))
   (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
     (if by-offset
 	(let ((offset (ivar-get-offset ivar)))
@@ -485,7 +488,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	(object-get-instance-variable-value object
 					    ivar))))
 
-(defun (setf objc-slot-value) (new-value object ivar-name &key by-offset (offset-type :int))
+(defmethod (setf objc-slot-value) (new-value object ivar-name &key by-offset (offset-type :int))
   (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
     (if by-offset
 	(setf (mem-ref object offset-type (ivar-get-offset ivar))
@@ -497,7 +500,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 (defun get-method-by-name (class name)
   (or 
    (loop for method in (get-direct-methods class)
-      when (string= name (method-name method))
+      when (string= name (objc-method-name method))
       return method)
    (and (has-superclass-p class)
 	(get-method-by-name (class-get-superclass class) name))))
@@ -505,7 +508,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 (defun methods-matching-regex (class regex)
   (append
    (loop for method in (get-direct-methods class)
-      when (cl-ppcre:all-matches regex (method-name method))
+      when (cl-ppcre:all-matches regex (objc-method-name method))
       collect method)
    (and (has-superclass-p class)
 	(methods-matching-regex (class-get-superclass class) regex))))
@@ -597,12 +600,153 @@ be able to call it from Objective-C. And, it's totally undocumented."
     
 |#
 
-(defclass objective-c-class ()
-  ((class-pointer :initarg :class-pointer)
-   (c-name :type string :initarg :c-name)
-   (ivar-offsets :type list :initform nil :initarg :ivar-offsets)))
+(defclass objective-c-class (standard-class)
+  ((class-pointer :initarg :class-pointer :initform nil)
+   (c-name :type string :initarg :c-name)))
 
-(defun make-accessor-name (class-name slot-name)
+(defclass objective-c-direct-slot-definition (standard-direct-slot-definition)
+  ((cffi-type :initform :pointer :initarg :cffi-type)
+   (objc-type :initform :id :initarg :objc-type)
+   (c-name :type string :initarg :c-name)
+   (offset :type (or null integer) :initarg :offset :initform nil)
+   (owning-class :initform nil)
+   (ivar :initarg :ivar :initform nil)))
+
+;; FIXME: Apparently, something extra must be done to make attributes on OBJECTIVE-C-DIRECT-SLOT-DEFINITIONs
+;;        carry over to their corresponding OBJECTIVE-C-EFFECTIVE-SLOT-DEFINITIONs.
+;;
+;; Here is a fully working version of the SLOT-ATTRIBUTES hack shown in the AMOP book:
+;;
+;; https://github.com/hanshuebner/bknr-datastore/blob/master/experimental/slot-attributes.lisp
+;;
+;; From it, it looks like it is necessary to implement a COMPUTE-EFFECTIVE-SLOT-DEFINITION
+;; that iterates over the DIRECT-SLOTS to find the slot with the expected attributes.
+
+(defclass objective-c-effective-slot-definition (standard-effective-slot-definition)
+  ((cffi-type :initform :pointer :initarg :cffi-type)
+   (objc-type :initform :id :initarg :objc-type)
+   (c-name :type string :initarg :c-name)
+   (offset :type (or null integer) :initarg :offset :initform nil)
+   (owning-class :initform nil)
+   (ivar :initarg :ivar :initform nil)))
+
+
+(defmethod validate-superclass ((class objective-c-class)
+				(super standard-class))
+  t)
+
+(defmethod validate-superclass ((class objective-c-direct-slot-definition)
+				(super standard-direct-slot-definition))
+  t)
+
+(defmethod validate-superclass ((class objective-c-effective-slot-definition)
+				(super standard-effective-slot-definition))
+  t)
+
+
+(defmethod direct-slot-definition-class ((class objective-c-class) &rest initargs)
+  (declare (ignore initargs))
+  'objective-c-direct-slot-definition)
+
+(defmethod effective-slot-definition-class ((class objective-c-class) &rest initargs)
+    'objective-c-effective-slot-definition)
+
+(defmacro check-slot-presence (class name obj slot)
+  `(unless (slot-value ,obj ,slot)
+     (error "Slot ~s in class ~s needs a ~s~%"
+	    ,name ,class
+	    (intern (symbol-name ,slot) :keyword))))
+
+(defun validate-slot-definition (class name slot-def)
+  (loop for slot in '(cffi-type objc-type)
+     do (check-slot-presence class name slot-def slot)))
+
+(defun objective-c-superclasses (class)
+  (handler-case
+      (remove-if-not
+       (lambda (class*)
+	 (and (not (eq class* class))
+	      (typep class* 'objective-c-class)))
+       (class-precedence-list class))
+    (unbound-slot () nil)))
+
+(defun compute-slots-for-superclasses (class)
+  (mapc #'compute-slots (reverse (objective-c-superclasses class)))
+  (values))
+
+(defparameter *direct-slots* nil)
+
+(defmethod compute-slots :before ((class objective-c-class))
+  (compute-slots-for-superclasses class))
+
+(defmethod compute-effective-slot-definition :around ((class objective-c-class) name direct-slots)
+  (let ((effective-slot (call-next-method)))
+    (if (typep effective-slot 'objective-c-effective-slot-definition)
+	(progn
+	  (push (list class name direct-slots effective-slot) *direct-slots*)
+	  (validate-slot-definition class name effective-slot)
+	  (unless (= (length direct-slots) 1)
+	    (error "Duplicate Objective-C slot ~s in Objective-C class ~s" name class))
+	  (loop for slot in '(cffi-type objc-type c-name offset)
+	     do (setf (slot-value effective-slot slot)
+		      (slot-value (car direct-slots) slot)))
+	  effective-slot)
+	effective-slot)))
+
+(defun create-ivar-for-slot (class effective-slot-definition)
+  (with-slots (cffi-type objc-type c-name offset ivar)
+      effective-slot-definition
+    (add-ivar (slot-value class 'class-pointer)
+	      c-name cffi-type objc-type)
+    (setf ivar (get-ivar-by-name (slot-value class 'class-pointer) c-name))
+    (setf offset (ivar-get-offset ivar))))
+
+(defun create-objective-c-parts (objective-c-class)
+  (unless (slot-value objective-c-class 'class-pointer)
+    (let ((supers (objective-c-superclasses objective-c-class)))
+      (when supers
+	(create-objective-c-parts supers))
+      (let ((objc-class (objc-alloc-class-pair (if supers
+						   (slot-value (car supers) 'class-pointer)
+						   *ns-object*)
+					       (car (slot-value objective-c-class 'c-name))
+					       0)))
+	(setf (slot-value objective-c-class 'class-pointer)
+	      objc-class))
+      (loop for slot-def in (class-slots objective-c-class)
+	 unless (or
+		 (not (typep slot-def 'objective-c-effective-slot-definition))
+		 (slot-value slot-def 'ivar))
+	   do (create-ivar-for-slot objective-c-class slot-def)))))
+
+(defmethod finalize-inheritance :after ((class objective-c-class))
+  (create-objective-c-parts class)
+  (objc-register-class-pair (slot-value class 'class-pointer)))
+
+(defmethod compute-slots ((class objective-c-class))
+  (cons (make-instance 'standard-effective-slot-definition
+		       :name 'foreign-pointer)
+	(call-next-method)))
+
+(defmethod allocate-instance :around ((class objective-c-class) &rest initargs)
+  (declare (ignore initargs))
+  (let ((instance (call-next-method)))
+    (declare (optimize (debug 3)))
+    (setf (slot-value instance 'foreign-pointer)
+	  (%send (slot-value class 'class-pointer)
+		 (method-getname
+		  (get-method-by-name
+		   (object-get-class (slot-value class 'class-pointer))
+		   "alloc"))
+		 :pointer
+		 nil))
+    instance))
+
+(defclass ns-object () ()
+  (:metaclass objective-c-class)
+  (:c-name "NSObject"))
+
+#|(defun make-accessor-name (class-name slot-name)
   (intern (format nil "~a-~a" class-name slot-name)
 	  (symbol-package slot-name)))
 
@@ -615,7 +759,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 		,@options))))
 	  
 
-#| (defmacro define-objective-c-class (class-name superclass direct-slots
+(defmacro define-objective-c-class (class-name superclass direct-slots
 				    &rest defclass-options)
   (let ((modified-slots (mapcar (lambda (slot)
 				  (add-objective-c-accessor class-name slot))
