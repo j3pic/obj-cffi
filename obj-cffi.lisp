@@ -1,7 +1,7 @@
-defpackage #:obj-cffi
+(cl:defpackage #:obj-cffi
   (:use #:closer-common-lisp #:cffi #:uiop/utility))
 
-(in-package #:obj-cffi)
+(cl:in-package #:obj-cffi)
 
 ;; An OSX app in plain C: https://github.com/jimon/osx_app_in_plain_c
 ;;
@@ -477,25 +477,35 @@ be able to call it from Objective-C. And, it's totally undocumented."
   (name :string))
 
 
-(defgeneric objc-slot-value (object ivar-name &key by-offset offset-type))
-(defgeneric (setf objc-slot-value) (new-value object ivar-name &key by-offset offset-type))
+(defun objc-slot-value* (object ivar &key ivar-offset (offset-type :int))
+  (if ivar-offset
+      (mem-ref object offset-type ivar-offset)
+      (object-get-instance-variable-value object
+					  ivar)))
 
-(defmethod objc-slot-value (object ivar-name &key by-offset (offset-type :int))
-  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
-    (if by-offset
-	(let ((offset (ivar-get-offset ivar)))
-	  (mem-ref object offset-type offset))
-	(object-get-instance-variable-value object
-					    ivar))))
-
-(defmethod (setf objc-slot-value) (new-value object ivar-name &key by-offset (offset-type :int))
-  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
-    (if by-offset
-	(setf (mem-ref object offset-type (ivar-get-offset ivar))
-	      new-value)
+(defun (setf objc-slot-value*) (new-value object ivar &key ivar-offset (offset-type :int))
+  (if ivar-offset
+      (setf (mem-ref object offset-type ivar-offset)
+	    new-value)
+      (progn
 	(object-set-instance-variable-value object ivar
-					    new-value))))
-  
+					    new-value)
+	new-value)))
+
+(defun objc-slot-value (object ivar-name &key by-offset (offset-type :int))
+  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
+    (objc-slot-value* object ivar
+		      :ivar-offset (if by-offset
+				       (ivar-get-offset ivar))
+		      :offset-type offset-type)))
+
+(defun (setf objc-slot-value) (new-value object ivar-name &key by-offset (offset-type :int))
+  (let ((ivar (class-get-instance-variable (object-get-class object) ivar-name)))
+    (setf (objc-slot-value* object ivar
+			    :offset (if by-offset
+					(ivar-get-offset ivar))
+			    :offset-type offset-type)
+	  new-value)))
 
 (defun get-method-by-name (class name)
   (or 
@@ -670,14 +680,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
        (class-precedence-list class))
     (unbound-slot () nil)))
 
-(defun compute-slots-for-superclasses (class)
-  (mapc #'compute-slots (reverse (objective-c-superclasses class)))
-  (values))
-
 (defparameter *direct-slots* nil)
-
-(defmethod compute-slots :before ((class objective-c-class))
-  (compute-slots-for-superclasses class))
 
 (defmethod compute-effective-slot-definition :around ((class objective-c-class) name direct-slots)
   (let ((effective-slot (call-next-method)))
@@ -720,13 +723,24 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	   do (create-ivar-for-slot objective-c-class slot-def)))))
 
 (defmethod finalize-inheritance :after ((class objective-c-class))
+  (format t "~%Finalizing inheritance for ~s~%" class)
   (create-objective-c-parts class)
   (objc-register-class-pair (slot-value class 'class-pointer)))
 
+(defun make-foreign-pointer-slot (class)
+  (let ((slotd (make-instance 'standard-effective-slot-definition
+			      :name 'foreign-pointer)))
+    #+(and sbcl nil) (setf (slot-value slotd 'sb-pcl::%class)
+		 class)
+    slotd))
+
 (defmethod compute-slots ((class objective-c-class))
-  (cons (make-instance 'standard-effective-slot-definition
-		       :name 'foreign-pointer)
-	(call-next-method)))
+  (let ((existing-slots (call-next-method)))
+    (if (find 'foreign-pointer existing-slots
+	      :key #'slot-definition-name)
+	existing-slots
+	(cons (make-foreign-pointer-slot class)
+	      existing-slots))))
 
 (defmethod allocate-instance :around ((class objective-c-class) &rest initargs)
   (declare (ignore initargs))
@@ -741,6 +755,20 @@ be able to call it from Objective-C. And, it's totally undocumented."
 		 :pointer
 		 nil))
     instance))
+
+(defmethod slot-value-using-class ((class objective-c-class) object (slotd objective-c-effective-slot-definition))
+  (objc-slot-value* (slot-value object 'foreign-pointer)
+		    (slot-value slotd 'ivar)
+		    :ivar-offset (slot-value slotd 'offset)
+		    :offset-type (slot-value slotd 'cffi-type)))
+
+(defmethod (setf slot-value-using-class) (new-value (class objective-c-class) object (slotd objective-c-effective-slot-definition))
+  (setf (objc-slot-value* (slot-value object 'foreign-pointer)
+			  (slot-value slotd 'ivar)
+			  :ivar-offset (slot-value slotd 'offset)
+			  :offset-type (slot-value slotd 'cffi-type))
+	new-value))
+
 
 (defclass ns-object () ()
   (:metaclass objective-c-class)
