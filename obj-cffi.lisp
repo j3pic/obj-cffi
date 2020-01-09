@@ -240,26 +240,6 @@
 (defcfun ("object_getClass" object-get-class) :pointer
   (object :pointer))
 
-;; FIXME: I'm trying to implement a class using this working example:
-;;
-;;        https://gist.github.com/mikeash/7603035
-;;
-;;        The author uses a function called imp_implementationWithBlock, which creates an
-;;        IMP object from an Objective-C block.
-;;
-;;        This seemed like an insurmountable obstacle, until I noticed that IMP objects
-;;        are just functions.
-;;
-;; In <objc.h>, the following definition of the IMP type exists:
-;;
-;;     typedef id _Nullable (*IMP)(id _Nonnull, SEL _Nonnull, ...);
-;;
-;; So perhaps IMPs can simply be a CFFI callback (use CFFI:DEFCALLBACK)
-;;
-;;  Upon looking at the macroexpansion for this, it looks like CFFI does not
-;;  support using LAMBDAs as callbacks, although it uses SB-ALIEN::ALIEN-LAMBDA in
-;;  its SBCL implementation.
-
 (defmacro defimp (name arguments &body body)
   "Define an Objective-C IMP function. The ARGUMENTS are just a list of variable names. When
 your IMP function is called, these arguments will all be CFFI :POINTERs.
@@ -329,7 +309,7 @@ The function will have an implicit first argument declared as (SELF :POINTER)."
 (defcfun "method_getDescription" (:pointer (:struct objc-method-description))
   (method :pointer))
 
-;;      SEL _Nullable name;               /**< The name of the method */
+;;    SEL _Nullable name;               /**< The name of the method */
 ;;    char * _Nullable types;           /**< The types of the method arguments */
 
 
@@ -577,39 +557,6 @@ be able to call it from Objective-C. And, it's totally undocumented."
     (:string "*")
     (:class "#")))
     
-;; https://gist.github.com/mikeash/7603035
-
-#| (defun make-test-class ()
-  (let* ((c (objc-alloc-class-pair *ns-object* "Test-Person" 0))
-	 (first-name-successfulp (class-add-ivar c "firstName" (foreign-type-size :pointer)
-						 (coerce (floor (log (foreign-type-size :pointer) 2))
-							 'integer) (null-pointer)))
-	 (last-name-successfulp (class-add-ivar c "lastName" (foreign-type-size :pointer)
-						(coerce (floor (log (foreign-type-size :pointer) 2))
-							'integer) (encode-type :id)))
-	 (age-successfulp (class-add-ivar c "age" (foreign-type-size :unsigned-int)
-					  (coerce (floor (log (foreign-type-size :unsigned-int) 2))
-						  'integer) (encode-type :id)))
-	 (first-name-ivar (class-get-instance-variable c "firstName"))
-	 (last-name-ivar (class-get-instance-variable c "lastName"))
-	 (age-ivar (class-get-instance-variable c "age"))
-	 (age-offset (ivar-get-offset age-ivar)))
-    
-    (defimp test-class-init ((first-name :string) (last-name :string) (age :int))
-      (object-set-ivar self first-name-ivar first-name)
-      (object-set-ivar self last-name-ivar last-name)
-      (setf (mem-ref age-offset :unsigned-int) age)
-      self)
-
-    (let ((type-string (apply #'concatenate 'string
-			      (mapcar #'encode-type
-				      '(:id :id :sel :id :id :uint)))))
-      (class-add-method c (sel-register-name "initWithFirstName:lastName:age:")
-			(callback test-class-init)
-			type-string))
-    
-|#
-
 (defclass objective-c-class (standard-class)
   ((class-pointer :initarg :class-pointer :initform nil)
    (c-name :type string :initarg :c-name)))
@@ -704,28 +651,35 @@ be able to call it from Objective-C. And, it's totally undocumented."
     (setf ivar (get-ivar-by-name (slot-value class 'class-pointer) c-name))
     (setf offset (ivar-get-offset ivar))))
 
-(defun create-objective-c-parts (objective-c-class)
+(defun create-objective-c-parts (objective-c-class class-precedence-list class-slots)
   (unless (slot-value objective-c-class 'class-pointer)
-    (let ((supers (objective-c-superclasses objective-c-class)))
-      (when supers
-	(create-objective-c-parts supers))
+    (let ((supers (remove-if-not
+		   (lambda (class)
+		     (typep class 'objective-c-class))
+		   (cdr class-precedence-list))))
       (let ((objc-class (objc-alloc-class-pair (if supers
 						   (slot-value (car supers) 'class-pointer)
 						   *ns-object*)
 					       (car (slot-value objective-c-class 'c-name))
 					       0)))
+	(if (null-pointer-p objc-class)
+	    (setf objc-class (objc-lookupclass (car (slot-value objective-c-class 'c-name)))))
+	(if (null-pointer-p objc-class)
+	    (error "Unable to create Objective-C class for CLOS class ~s"
+		   objective-c-class))
+	
 	(setf (slot-value objective-c-class 'class-pointer)
 	      objc-class))
-      (loop for slot-def in (class-slots objective-c-class)
+      
+      (loop for slot-def in class-slots
 	 unless (or
 		 (not (typep slot-def 'objective-c-effective-slot-definition))
 		 (slot-value slot-def 'ivar))
 	   do (create-ivar-for-slot objective-c-class slot-def)))))
 
-(defmethod finalize-inheritance :after ((class objective-c-class))
+(defmethod finalize-inheritance :before ((class objective-c-class))
   (format t "~%Finalizing inheritance for ~s~%" class)
-  (create-objective-c-parts class)
-  (objc-register-class-pair (slot-value class 'class-pointer)))
+  (mapc #'finalize-inheritance (objective-c-superclasses class)))
 
 (defun make-foreign-pointer-slot (class)
   (let ((slotd (make-instance 'standard-effective-slot-definition
@@ -736,6 +690,10 @@ be able to call it from Objective-C. And, it's totally undocumented."
 
 (defmethod compute-slots ((class objective-c-class))
   (let ((existing-slots (call-next-method)))
+    (create-objective-c-parts class (class-precedence-list class)
+			      existing-slots)
+    (objc-register-class-pair (slot-value class 'class-pointer))
+    
     (if (find 'foreign-pointer existing-slots
 	      :key #'slot-definition-name)
 	existing-slots
@@ -743,7 +701,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	      existing-slots))))
 
 (defmethod allocate-instance :around ((class objective-c-class) &rest initargs)
-  (declare (ignore initargs))
+;;  (declare (ignore initargs))
+  (format t "~%Allocating an instance of ~s instantiated with ~s~%" class initargs)
   (let ((instance (call-next-method)))
     (declare (optimize (debug 3)))
     (setf (slot-value instance 'foreign-pointer)
@@ -774,29 +733,18 @@ be able to call it from Objective-C. And, it's totally undocumented."
   (:metaclass objective-c-class)
   (:c-name "NSObject"))
 
-#|(defun make-accessor-name (class-name slot-name)
-  (intern (format nil "~a-~a" class-name slot-name)
-	  (symbol-package slot-name)))
 
-(defun add-objective-c-accessor (class-name slot-def)
-  (if (getf (cdr slot-def) :accessor)
-      slot-def
-      (destructuring-bind (name &rest options)
-	  slot-def
-	`(,name :accessor ,(make-accessor-name class-name name)
-		,@options))))
-	  
+;; TODO: Automatically determine if an offset is needed based on the type
+;; TODO: Allow manual specification of whether an offset is needed.
+;; TODO: Some sort of protocol to allow CLOS objects to be replaced by
+;;       Objective-C objects when assigned to slots. Probably very simple
+;;       to do.
+(defclass wtf-class ()
+  ((wtf-value :initarg :wtf-value :objc-type :string :c-name "da_value" :cffi-type :string))
+  (:metaclass objective-c-class)
+  (:c-name "WtfClass"))
 
-(defmacro define-objective-c-class (class-name superclass direct-slots
-				    &rest defclass-options)
-  (let ((modified-slots (mapcar (lambda (slot)
-				  (add-objective-c-accessor class-name slot))
-				direct-slots)))
-    `(progn
-       (defclass ,class-name (,superclass)
-	 ,modified-slots
-	 ,@defclass-options)
-       ,@(loop for (slot-name . options) in modified-slots
-	    collect `(defmethod ,(getf :accessor options) :before ((object ,class-name))
-				
-|#
+(defclass wtf-subclass (wtf-class)
+  ((wtf-value-2 :initarg :wtf-value :objc-type :string :c-name "da_odda_value" :cffi-type :string))
+  (:metaclass objective-c-class)
+  (:c-name "WtfSubClass"))
