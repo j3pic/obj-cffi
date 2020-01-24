@@ -751,7 +751,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;;
 ;; FIXME 2: Any translation that needs to be done on slot assignment
 ;;          also needs to be done when passing arguments to functions,
-;;          and also when returning values from Objective-C functions.
+;;          and any translation done upon access to a slot also needs
+;;          to be done when returning values from Objective-C functions.
 ;;
 ;;          Major refactoring is needed to support it without duplicating
 ;;          code.
@@ -830,7 +831,10 @@ be able to call it from Objective-C. And, it's totally undocumented."
 			  (slot-value slotd 'ivar)
 			  :ivar-offset (slot-value slotd 'offset)
 			  :offset-type (slot-value slotd 'cffi-type))
-	new-value))
+	(if (typep (class-of new-value)
+		   'objective-c-class)
+	    (slot-value new-value 'foreign-pointer)
+	    new-value)))
 
 
 (defclass ns-object () ()
