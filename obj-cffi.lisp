@@ -538,7 +538,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 (defun encode-type (type)
   "Returns a Lisp string encoding the given TYPE.
   FIXME: Not all types are supported. See https://nshipster.com/type-encodings/"
-  (ecase type
+  (case type
     (:id "@")
     ((:sel :selector) ":")
     (:ulong "L")
@@ -557,8 +557,15 @@ be able to call it from Objective-C. And, it's totally undocumented."
     (:void "v")
     (:string "*")
     (:pointer "^v")
-    (:class "#")))
-    
+    (:class "#")
+    (otherwise
+     (cond ((and (consp type)
+		 (eq (car type) :pointer))
+	    (concatenate 'string "^"
+			 (encode-type (cadr type))))
+	   (t (error "Cannot translate type ~s into an Objective-C type string." type))))))
+	    
+	    
 (defclass objective-c-class (standard-class)
   ((class-pointer :initarg :class-pointer :initform nil)
    (c-name :type string :initarg :c-name)))
@@ -738,6 +745,17 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;; if somebody later defines a class? It would be hard to
 ;; find an opportunity to detect such an event.
 
+;; FIXME: Other translations are possible. For instance,
+;; Lisp booleans could be translated to and from Objective-C
+;; bools.
+;;
+;; FIXME 2: Any translation that needs to be done on slot assignment
+;;          also needs to be done when passing arguments to functions,
+;;          and also when returning values from Objective-C functions.
+;;
+;;          Major refactoring is needed to support it without duplicating
+;;          code.
+
 (defun wrap-ivar-value-in-clos-object (value containing-object clos-wrapper slot-definition)
   "In reality, Objective-C objects contain two sets of slots:
 
@@ -826,6 +844,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;;       Objective-C objects when assigned to slots. Probably very simple
 ;;       to do.
 ;; TODO: Convert Lisp strings to Objective-C NSString objects.
+;; TODO: Translate OBJECTIVE-C-CLASS objects to pointers during
+;;       calls to C and Objective-C functions.
 #|(defclass wtf-class ()
   ((wtf-value :initarg :wtf-value :objc-type :string :c-name "da_value" :cffi-type :string))
   (:metaclass objective-c-class)
