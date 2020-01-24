@@ -536,7 +536,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 (defparameter *my-big-class* (objc-alloc-class-pair *ns-object* "BigMadeWithLisp" 8))
 
 (defun encode-type (type)
-  "Returns a Lisp string encoding the given TYPE."
+  "Returns a Lisp string encoding the given TYPE.
+  FIXME: Not all types are supported. See https://nshipster.com/type-encodings/"
   (ecase type
     (:id "@")
     ((:sel :selector) ":")
@@ -555,6 +556,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
     (:bool "B")
     (:void "v")
     (:string "*")
+    (:pointer "^v")
     (:class "#")))
     
 (defclass objective-c-class (standard-class)
@@ -580,7 +582,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;; that iterates over the DIRECT-SLOTS to find the slot with the expected attributes.
 
 (defclass objective-c-effective-slot-definition (standard-effective-slot-definition)
-  ((cffi-type :initform :pointer :initarg :cffi-type)
+  ((cffi-type :initform nil :initarg :cffi-type)
    (objc-type :initform :id :initarg :objc-type)
    (c-name :type string :initarg :c-name)
    (offset :type (or null integer) :initarg :offset :initform nil)
@@ -629,11 +631,20 @@ be able to call it from Objective-C. And, it's totally undocumented."
 
 (defparameter *direct-slots* nil)
 
+(defun infer-cffi-type (objc-type)
+  (case objc-type
+    ((:id :sel :selector :class)
+     :pointer)
+    (:bool :int)
+    (otherwise objc-type)))
+
 (defmethod compute-effective-slot-definition :around ((class objective-c-class) name direct-slots)
   (let ((effective-slot (call-next-method)))
     (if (typep effective-slot 'objective-c-effective-slot-definition)
 	(progn
-	  (push (list class name direct-slots effective-slot) *direct-slots*)
+	  (unless (slot-value effective-slot 'cffi-type)
+	    (setf (slot-value effective-slot 'cffi-type)
+		  (infer-cffi-type (slot-value effective-slot 'objc-type))))
 	  (validate-slot-definition class name effective-slot)
 	  (unless (= (length direct-slots) 1)
 	    (error "Duplicate Objective-C slot ~s in Objective-C class ~s" name class))
@@ -650,6 +661,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	      c-name cffi-type objc-type)
     (setf ivar (get-ivar-by-name (slot-value class 'class-pointer) c-name))
     (setf offset (ivar-get-offset ivar))))
+
+(defvar *objc-class-to-lisp-class* (make-hash-table :test 'eq))
 
 (defun create-objective-c-parts (objective-c-class class-precedence-list class-slots)
   (unless (slot-value objective-c-class 'class-pointer)
@@ -675,17 +688,19 @@ be able to call it from Objective-C. And, it's totally undocumented."
 	 unless (or
 		 (not (typep slot-def 'objective-c-effective-slot-definition))
 		 (slot-value slot-def 'ivar))
-	   do (create-ivar-for-slot objective-c-class slot-def)))))
+	 do (create-ivar-for-slot objective-c-class slot-def))))
+  (setf (gethash (slot-value objective-c-class 'class-pointer)
+		 *objc-class-to-lisp-class*)
+	objective-c-class))
 
 (defmethod finalize-inheritance :before ((class objective-c-class))
   (format t "~%Finalizing inheritance for ~s~%" class)
   (mapc #'finalize-inheritance (objective-c-superclasses class)))
 
 (defun make-foreign-pointer-slot (class)
+  (declare (ignore class))
   (let ((slotd (make-instance 'standard-effective-slot-definition
 			      :name 'foreign-pointer)))
-    #+(and sbcl nil) (setf (slot-value slotd 'sb-pcl::%class)
-		 class)
     slotd))
 
 (defmethod compute-slots ((class objective-c-class))
@@ -715,14 +730,85 @@ be able to call it from Objective-C. And, it's totally undocumented."
 		 nil))
     instance))
 
-(defmethod slot-value-using-class ((class objective-c-class) object (slotd objective-c-effective-slot-definition))
-  (objc-slot-value* (slot-value object 'foreign-pointer)
-		    (slot-value slotd 'ivar)
-		    :ivar-offset (slot-value slotd 'offset)
-		    :offset-type (slot-value slotd 'cffi-type)))
 
-(defmethod (setf slot-value-using-class) (new-value (class objective-c-class) object (slotd objective-c-effective-slot-definition))
-  (setf (objc-slot-value* (slot-value object 'foreign-pointer)
+;; However, there's a second problem: Objective-C code can
+;; assign objects to IVARs for which we have no CLOS wrapper
+;; defined. I suppose it would be legitimate to wrap such
+;; pointers in instances of the NS-OBJECT class. But what
+;; if somebody later defines a class? It would be hard to
+;; find an opportunity to detect such an event.
+
+(defun wrap-ivar-value-in-clos-object (value containing-object clos-wrapper slot-definition)
+  "In reality, Objective-C objects contain two sets of slots:
+
+     1. Lisp slots.
+     2. Objective-C Ivars.
+
+   When you use SLOT-VALUE to assign to an Objective-C object, this library
+   copies the value to both the Lisp slot and the Objective-C Ivar.
+
+   When accessing the slot, it generally only reads the Objective-C Ivar.
+
+   But there is a problem: You can't assign CLOS objects to Objective-C Ivars.
+   Only C pointers to Objective-C objects can be assigned there.
+
+   Consequently, when you assign a CLOS object, its Objective-C pointer is what
+   gets stored in the Ivar. But if we just read the Objective-C Ivar when accessing
+   the slot, that means you'd get a foreign pointer back, instead of the CLOS object
+   you originally assigned.
+
+   This function is used to solve that problem. It returns the original CLOS object
+   if the Ivar still has the same foreign pointer as when you last assigned it,
+   otherwise it creates a new CLOS object. It attempts to look up the Lisp definition
+   of the object's class, or if there isn't one, creates an NS-OBJECT object."
+  (let ((original-foreign-pointer (slot-value clos-wrapper 'foreign-pointer)))
+    (cond ((eq original-foreign-pointer value)
+	   clos-wrapper)
+	  ((not (null-pointer-p value))
+	   (let* ((current-class (object-get-class value))
+		  (original-class (object-get-class original-foreign-pointer))
+		  (new-clos-wrapper (make-instance
+				     (if (eq current-class original-class)
+					 (class-of clos-wrapper)
+					 (or (gethash current-class *objc-class-to-lisp-class*)
+					     'ns-object)))))
+	     (setf (slot-value new-clos-wrapper 'foreign-pointer) value)
+	     (setf (slot-value-using-class (find-class 'standard-class)
+					   containing-object
+					   slot-definition)
+		   new-clos-wrapper)))
+	  ;; FIXME: I'm not sure what the best thing to do is with Objective-C
+	  ;;        nils (aka NULL pointers). Should they be translated to Lisp
+	  ;;        NIL? Perhaps not, since we really don't know if it arose from
+	  ;;        a call to plain C code or not.
+	  (t value))))
+
+
+(defun maybe-wrap-value (value object slotd)
+  (let ((clos-value (slot-value-using-class (find-class 'standard-class)
+					    object
+					    slotd)))
+    (if (or (and (null clos-value)
+		 (eq (slot-value slotd 'objc-type) :id))
+	    (typep (class-of clos-value)
+		   'objective-c-class))
+	(wrap-ivar-value-in-clos-object value object clos-value slotd)
+	value)))
+
+(defmethod slot-value-using-class ((class objective-c-class) object (slotd objective-c-effective-slot-definition))
+  (maybe-wrap-value
+   (objc-slot-value* (slot-value object 'foreign-pointer)
+		     (slot-value slotd 'ivar)
+		     :ivar-offset (slot-value slotd 'offset)
+		     :offset-type (slot-value slotd 'cffi-type))
+   object
+   slotd))
+
+(defmethod (setf slot-value-using-class) :after (new-value (class objective-c-class) object (slotd objective-c-effective-slot-definition))
+  (setf (objc-slot-value* (if (typep (class-of object)
+				     'objective-c-class)
+			      (slot-value object 'foreign-pointer)
+			      object)
 			  (slot-value slotd 'ivar)
 			  :ivar-offset (slot-value slotd 'offset)
 			  :offset-type (slot-value slotd 'cffi-type))
@@ -739,7 +825,8 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;; TODO: Some sort of protocol to allow CLOS objects to be replaced by
 ;;       Objective-C objects when assigned to slots. Probably very simple
 ;;       to do.
-(defclass wtf-class ()
+;; TODO: Convert Lisp strings to Objective-C NSString objects.
+#|(defclass wtf-class ()
   ((wtf-value :initarg :wtf-value :objc-type :string :c-name "da_value" :cffi-type :string))
   (:metaclass objective-c-class)
   (:c-name "WtfClass"))
@@ -748,3 +835,4 @@ be able to call it from Objective-C. And, it's totally undocumented."
   ((wtf-value-2 :initarg :wtf-value :objc-type :string :c-name "da_odda_value" :cffi-type :string))
   (:metaclass objective-c-class)
   (:c-name "WtfSubClass"))
+|#
