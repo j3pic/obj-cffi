@@ -669,7 +669,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
     (setf ivar (get-ivar-by-name (slot-value class 'class-pointer) c-name))
     (setf offset (ivar-get-offset ivar))))
 
-(defvar *objc-class-to-lisp-class* (make-hash-table :test 'eq))
+(defvar *objc-class-to-lisp-class* (trivial-garbage:make-weak-hash-table :test 'eq :weakness :value))
 
 (defun create-objective-c-parts (objective-c-class class-precedence-list class-slots)
   (unless (slot-value objective-c-class 'class-pointer)
@@ -756,7 +756,7 @@ be able to call it from Objective-C. And, it's totally undocumented."
 ;;
 ;;          Major refactoring is needed to support it without duplicating
 ;;          code.
-
+;;
 (defun wrap-ivar-value-in-clos-object (value containing-object clos-wrapper slot-definition)
   "In reality, Objective-C objects contain two sets of slots:
 
